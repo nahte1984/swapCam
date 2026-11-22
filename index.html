@@ -102,6 +102,89 @@
     pointer-events: none;
   }
   #msg[hidden] { display: none; }
+
+  /* ---------- 畫面下方：投影縮寫標籤（點了就拍照）＋存檔詢問 ---------- */
+  #hud {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: calc(30px + env(safe-area-inset-bottom, 0px));
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 19px;
+    color: var(--c);
+    font-family: 'Bricolage Grotesque', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+    font-variation-settings: "opsz" 14, "wdth" 100;
+    pointer-events: none;
+    z-index: 1;
+  }
+  #hud[hidden] { display: none; }
+
+  #tag {
+    -webkit-appearance: none;
+    appearance: none;
+    position: relative;
+    box-sizing: border-box;
+    margin: 0;
+    height: 17px;
+    padding: 0 5px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    border: 1px solid var(--c);
+    border-radius: 4px;
+    color: var(--c);
+    font: inherit;
+    font-weight: 600;
+    font-size: 14px;
+    line-height: 15px;
+    white-space: nowrap;
+    cursor: pointer;
+    pointer-events: auto;
+  }
+  #tag:focus { outline: none; }
+  #tag::before,
+  .opt::before {                 /* 放大手指的點擊範圍 */
+    content: '';
+    position: absolute;
+    inset: -12px -16px;
+  }
+
+  #ask {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    font-weight: 300;
+  }
+  #ask[hidden] { display: none; }
+  #askMsg {
+    font-size: 14px;
+    line-height: 17px;
+  }
+  .opt {
+    -webkit-appearance: none;
+    appearance: none;
+    position: relative;
+    margin: 0;
+    padding: 0;
+    background: none;
+    border: 0;
+    color: inherit;
+    font: inherit;
+    font-size: 20px;
+    line-height: 24px;
+    text-decoration: underline;
+    text-decoration-thickness: 1px;
+    text-underline-offset: 2px;
+    white-space: nowrap;
+    cursor: pointer;
+    pointer-events: auto;
+  }
+  .opt:focus { outline: none; }
+  .opt::before { inset: -4px -16px; }
 </style>
 </head>
 <body>
@@ -112,6 +195,15 @@
 <div id="splash">
   <button id="go" type="button">RE→ORDER</button>
   <div id="msg" hidden>Camera Unavailable</div>
+</div>
+
+<div id="hud" hidden>
+  <div id="ask" hidden>
+    <div id="askMsg">Save as PNG?</div>
+    <button class="opt" id="save" type="button">Save</button>
+    <button class="opt" id="cancel" type="button">Cancel</button>
+  </div>
+  <button id="tag" type="button">SPAE</button>
 </div>
 
 <script>
@@ -131,8 +223,13 @@
   const canvas = document.getElementById('stage');
   const video  = document.getElementById('cam');
   const root   = document.documentElement;
+  const hud    = document.getElementById('hud');
+  const tag    = document.getElementById('tag');
+  const ask    = document.getElementById('ask');
+  const save   = document.getElementById('save');
+  const cancel = document.getElementById('cancel');
 
-  /* ================= splash：框線與文字的色相漸變 ================= */
+  /* ================= splash 與標籤：框線與文字的色相漸變 ================= */
   let hueRAF = 0;
   const hueT0 = performance.now();
   function hueTick(now) {
@@ -260,10 +357,10 @@
 
   /* ================= 四種排列方式 ================= */
   const MODES = [
-    { flip: 1, shape: 0 },  // 載入時：最底 → 圓心，最上方 → 最外圈（圓形）
-    { flip: 0, shape: 0 },  // 最上方 → 圓心，最底 → 最外圈（圓形）
-    { flip: 1, shape: 1 },  // 最底 → 中心，最上方 → 最外圈（方形，貼合螢幕比例）
-    { flip: 0, shape: 1 }   // 最上方 → 中心，最底 → 最外圈（方形，貼合螢幕比例）
+    { flip: 1, shape: 0, name: 'SPAE' },  // 載入時：最底 → 圓心，最上方 → 最外圈（South Polar Azimuthal Equidistant）
+    { flip: 0, shape: 0, name: 'NPAE' },  // 最上方 → 圓心，最底 → 最外圈（North Polar Azimuthal Equidistant）
+    { flip: 1, shape: 1, name: 'SPRE' },  // 最底 → 中心，最上方 → 最外圈（South Polar Rectangular Equidistant）
+    { flip: 0, shape: 1, name: 'NPRE' }   // 最上方 → 中心，最底 → 最外圈（North Polar Rectangular Equidistant）
   ];
   let mode = 0;
 
@@ -279,6 +376,7 @@
     gl.uniform1f(U.uShape, m.shape);
     gl.uniform1f(U.uAspect, W / H);
     gl.uniform1f(U.uRmax, Rmax);
+    tag.textContent = m.name;
   }
 
   function resize() {
@@ -309,14 +407,23 @@
 
   /* ================= 每幀即時重新排列 ================= */
   let running = false;
+  let frozen  = false;        // 拍照後靜止在當下畫面
 
-  function frame() {
-    requestAnimationFrame(frame);
-    if (!running || video.readyState < 2 || !video.videoWidth) return;  // 切換鏡頭時停在上一幀
+  function videoReady() {
+    return video.readyState >= 2 && video.videoWidth > 0;
+  }
+
+  function render() {
     gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, video);
     updateCrop(video.videoWidth, video.videoHeight);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
+  }
+
+  function frame() {
+    requestAnimationFrame(frame);
+    if (!running || frozen || !videoReady()) return;  // 靜止或切換鏡頭時，停在上一幀
+    render();
   }
 
   /* ================= 相機 ================= */
@@ -388,12 +495,12 @@
   /* ================= splash ↔ 畫面 ================= */
   function showSplash(unavailable) {
     running = false;
+    unfreeze();
     stopStream();
+    hud.hidden = true;
     msg.hidden = !unavailable;
     go.disabled = false;
     splash.classList.remove('gone');
-    cancelAnimationFrame(hueRAF);
-    hueRAF = requestAnimationFrame(hueTick);
   }
 
   async function start() {
@@ -408,7 +515,7 @@
       multiCam = (await listCameras()).length > 1;
       running = true;
       splash.classList.add('gone');
-      cancelAnimationFrame(hueRAF);
+      hud.hidden = false;
     } catch (err) {
       console.error(err);
       showSplash(true);                          // 顯示 Camera Unavailable，再點按鈕重新取得
@@ -437,7 +544,7 @@
   }
 
   window.addEventListener('pointerdown', (e) => {
-    if (!running) return;
+    if (!running || frozen) return;
     if (e.pointerType === 'mouse' && e.button !== 0) return;
 
     if (!multiCam) {                             // 只有一顆鏡頭：點一下立即換
@@ -461,6 +568,71 @@
 
   // 桌機上點兩下不要選取文字或放大
   window.addEventListener('dblclick', e => e.preventDefault());
+
+  /* ================= 點標籤：拍照 → 靜止 → 詢問是否存成 PNG ================= */
+  let shot = null;    // { name, ready: Promise<Blob>, blob }
+
+  function stamp() {
+    const d = new Date(), p = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+  }
+
+  function capture() {
+    if (!running || frozen || switching || !videoReady()) return;
+    clearTimeout(tapTimer);                      // 取消還在等的「點一下換模式」
+    tapTimer = 0;
+    frozen = true;
+
+    render();                                    // 畫下當下這一幀，並立刻從畫布取出 PNG
+    const s = { name: `${MODES[mode].name}-${stamp()}.png`, blob: null };
+    s.ready = new Promise(res => canvas.toBlob(b => { s.blob = b; res(b); }, 'image/png'));
+    shot = s;
+    ask.hidden = false;
+  }
+
+  function unfreeze() {
+    frozen = false;
+    shot = null;
+    ask.hidden = true;
+  }
+
+  function download(blob, name) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+  }
+
+  async function savePNG() {
+    const s = shot;
+    if (!s) return;
+    const blob = s.blob || await s.ready;
+    if (blob) {
+      const file = new File([blob], s.name, { type: 'image/png' });
+      const touch = window.matchMedia && matchMedia('(pointer: coarse)').matches;
+      if (touch && navigator.canShare && navigator.canShare({ files: [file] })) {
+        // 手機：叫出分享選單，可「儲存影像」到相簿或存到檔案
+        try {
+          await navigator.share({ files: [file] });
+        } catch (err) {
+          if (err && err.name !== 'AbortError') download(blob, s.name);
+        }
+      } else {
+        download(blob, s.name);                  // 桌機：直接下載 PNG
+      }
+    }
+    unfreeze();
+  }
+
+  // 這些按鈕的點擊不要傳到畫面上（不換模式、不換鏡頭）
+  [tag, save, cancel].forEach(el => el.addEventListener('pointerdown', e => e.stopPropagation()));
+  tag.addEventListener('click', () => { if (!frozen) capture(); });
+  save.addEventListener('click', savePNG);
+  cancel.addEventListener('click', unfreeze);
 
   requestAnimationFrame(frame);
 })();
