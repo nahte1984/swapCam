@@ -103,7 +103,7 @@
   }
   #msg[hidden] { display: none; }
 
-  /* ---------- 畫面下方：投影縮寫標籤（點了就拍照）＋存檔詢問 ---------- */
+  /* ---------- 畫面下方：投影縮寫標籤（點了就拍照存檔） ---------- */
   #hud {
     position: fixed;
     left: 0;
@@ -145,46 +145,11 @@
     pointer-events: auto;
   }
   #tag:focus { outline: none; }
-  #tag::before,
-  .opt::before {                 /* 放大手指的點擊範圍 */
+  #tag::before {                 /* 放大手指的點擊範圍 */
     content: '';
     position: absolute;
     inset: -12px -16px;
   }
-
-  #ask {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 8px;
-    font-weight: 300;
-  }
-  #ask[hidden] { display: none; }
-  #askMsg {
-    font-size: 14px;
-    line-height: 17px;
-  }
-  .opt {
-    -webkit-appearance: none;
-    appearance: none;
-    position: relative;
-    margin: 0;
-    padding: 0;
-    background: none;
-    border: 0;
-    color: inherit;
-    font: inherit;
-    font-size: 20px;
-    line-height: 24px;
-    text-decoration: underline;
-    text-decoration-thickness: 1px;
-    text-underline-offset: 2px;
-    white-space: nowrap;
-    cursor: pointer;
-    pointer-events: auto;
-  }
-  .opt:focus { outline: none; }
-  .opt::before { inset: -4px -16px; }
 </style>
 </head>
 <body>
@@ -198,11 +163,6 @@
 </div>
 
 <div id="hud" hidden>
-  <div id="ask" hidden>
-    <div id="askMsg">Save as PNG?</div>
-    <button class="opt" id="save" type="button">Save</button>
-    <button class="opt" id="cancel" type="button">Cancel</button>
-  </div>
   <button id="tag" type="button">SPAE</button>
 </div>
 
@@ -225,9 +185,6 @@
   const root   = document.documentElement;
   const hud    = document.getElementById('hud');
   const tag    = document.getElementById('tag');
-  const ask    = document.getElementById('ask');
-  const save   = document.getElementById('save');
-  const cancel = document.getElementById('cancel');
 
   /* ================= splash 與標籤：框線與文字的色相漸變 ================= */
   let hueRAF = 0;
@@ -569,31 +526,76 @@
   // 桌機上點兩下不要選取文字或放大
   window.addEventListener('dblclick', e => e.preventDefault());
 
-  /* ================= 點標籤：拍照 → 靜止 → 詢問是否存成 PNG ================= */
-  let shot = null;    // { name, ready: Promise<Blob>, blob }
-
+  /* ================= 點標籤：畫面靜止 → 直接叫出作業系統的存檔介面 ================= */
   function stamp() {
     const d = new Date(), p = n => String(n).padStart(2, '0');
     return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
   }
 
-  function capture() {
+  // 同步取出 PNG：存檔介面必須在同一個點擊動作裡叫出來，不能先等非同步的 toBlob
+  function canvasPNG() {
+    const url = canvas.toDataURL('image/png');
+    const bin = atob(url.slice(url.indexOf(',') + 1));
+    const arr = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+    return new Blob([arr], { type: 'image/png' });
+  }
+
+  async function capture() {
     if (!running || frozen || switching || !videoReady()) return;
     clearTimeout(tapTimer);                      // 取消還在等的「點一下換模式」
     tapTimer = 0;
     frozen = true;
 
     render();                                    // 畫下當下這一幀，並立刻從畫布取出 PNG
-    const s = { name: `${MODES[mode].name}-${stamp()}.png`, blob: null };
-    s.ready = new Promise(res => canvas.toBlob(b => { s.blob = b; res(b); }, 'image/png'));
-    shot = s;
-    ask.hidden = false;
+    const name = `${MODES[mode].name}-${stamp()}.png`;
+    try {
+      await saveFile(canvasPNG(), name);
+    } catch (err) {
+      console.error(err);
+    }
+    unfreeze();                                  // 存好或按取消，都回到即時互動
   }
 
   function unfreeze() {
     frozen = false;
-    shot = null;
-    ask.hidden = true;
+  }
+
+  async function saveFile(blob, name) {
+    const file = new File([blob], name, { type: 'image/png' });
+    const touch = window.matchMedia && matchMedia('(pointer: coarse)').matches;
+
+    // 手機：系統分享選單（可「儲存影像」到相簿，或存到檔案）
+    if (touch && navigator.canShare && navigator.canShare({ files: [file] })) {
+      try {
+        await navigator.share({ files: [file] });
+        return;
+      } catch (err) {
+        if (err && err.name === 'AbortError') return;      // 按了取消
+        // 其他錯誤 → 改用下載
+      }
+    }
+    // 桌機 Chrome / Edge：系統的「另存新檔」視窗
+    else if (window.showSaveFilePicker) {
+      let handle = null;
+      try {
+        handle = await window.showSaveFilePicker({
+          suggestedName: name,
+          types: [{ description: 'PNG image', accept: { 'image/png': ['.png'] } }]
+        });
+      } catch (err) {
+        if (err && err.name === 'AbortError') return;      // 按了取消
+      }
+      if (handle) {
+        const w = await handle.createWritable();
+        await w.write(blob);
+        await w.close();
+        return;
+      }
+    }
+    // 其他瀏覽器：一般下載（沒有對話框，畫面稍微停一下讓人感覺到拍下來了）
+    download(blob, name);
+    await new Promise(r => setTimeout(r, 800));
   }
 
   function download(blob, name) {
@@ -607,32 +609,9 @@
     setTimeout(() => URL.revokeObjectURL(url), 4000);
   }
 
-  async function savePNG() {
-    const s = shot;
-    if (!s) return;
-    const blob = s.blob || await s.ready;
-    if (blob) {
-      const file = new File([blob], s.name, { type: 'image/png' });
-      const touch = window.matchMedia && matchMedia('(pointer: coarse)').matches;
-      if (touch && navigator.canShare && navigator.canShare({ files: [file] })) {
-        // 手機：叫出分享選單，可「儲存影像」到相簿或存到檔案
-        try {
-          await navigator.share({ files: [file] });
-        } catch (err) {
-          if (err && err.name !== 'AbortError') download(blob, s.name);
-        }
-      } else {
-        download(blob, s.name);                  // 桌機：直接下載 PNG
-      }
-    }
-    unfreeze();
-  }
-
-  // 這些按鈕的點擊不要傳到畫面上（不換模式、不換鏡頭）
-  [tag, save, cancel].forEach(el => el.addEventListener('pointerdown', e => e.stopPropagation()));
+  // 標籤的點擊不要傳到畫面上（不換模式、不換鏡頭）
+  tag.addEventListener('pointerdown', e => e.stopPropagation());
   tag.addEventListener('click', () => { if (!frozen) capture(); });
-  save.addEventListener('click', savePNG);
-  cancel.addEventListener('click', unfreeze);
 
   requestAnimationFrame(frame);
 })();
