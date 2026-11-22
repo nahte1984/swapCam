@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#313131">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>RE→ORDER</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wdth,wght@12..96,75..100,200..800&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #313131;
+    --c: #1eff00;               /* 由 JS 每幀改寫，色相繞色相環 */
+  }
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: var(--bg);
+    overflow: hidden;
+    overscroll-behavior: none;
+  }
+  body {
+    -webkit-tap-highlight-color: transparent;
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+  }
+
+  #stage {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+    background: var(--bg);
+  }
+
+  /* 影片元素要留在 DOM 裡（iOS 才會持續更新畫面），但看不到 */
+  #cam {
+    position: fixed;
+    left: 0;
+    top: 0;
+    width: 1px;
+    height: 1px;
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  /* ---------- splash ---------- */
+  #splash {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--bg);
+    z-index: 2;
+  }
+  #splash.gone { display: none; }
+
+  #go {
+    -webkit-appearance: none;
+    appearance: none;
+    margin: 0;
+    height: 38px;
+    padding: 0 16px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    border: 1px solid var(--c);
+    border-radius: 0;
+    color: var(--c);
+    font-family: 'Bricolage Grotesque', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+    font-weight: 300;
+    font-size: 28px;
+    line-height: normal;
+    font-variation-settings: "opsz" 14, "wdth" 100;
+    white-space: nowrap;
+    cursor: pointer;
+  }
+  #go:disabled { cursor: default; }
+  #go:focus { outline: none; }
+
+  /* 按鈕下緣往下 19px */
+  #msg {
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: calc(50% + 38px);
+    text-align: center;
+    color: var(--c);
+    font-family: 'Bricolage Grotesque', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+    font-weight: 300;
+    font-size: 14px;
+    line-height: 17px;
+    font-variation-settings: "opsz" 14, "wdth" 100;
+    pointer-events: none;
+  }
+  #msg[hidden] { display: none; }
+</style>
+</head>
+<body>
+
+<canvas id="stage"></canvas>
+<video id="cam" playsinline muted autoplay></video>
+
+<div id="splash">
+  <button id="go" type="button">RE→ORDER</button>
+  <div id="msg" hidden>Camera Unavailable</div>
+</div>
+
+<script>
+(() => {
+  'use strict';
+
+  /* ================= 參數 ================= */
+  const HUE_START  = 113;    // #1eff00 的色相
+  const HUE_PERIOD = 15000;  // splash 色相環走完一圈的時間，ms
+  const MAX_DPR    = 2;      // 畫布解析度上限
+  const DOUBLE_TAP = 300;    // 兩下點擊的判定時間，ms
+  const BG         = [49 / 255, 49 / 255, 49 / 255]; // #313131
+
+  const splash = document.getElementById('splash');
+  const go     = document.getElementById('go');
+  const msg    = document.getElementById('msg');
+  const canvas = document.getElementById('stage');
+  const video  = document.getElementById('cam');
+  const root   = document.documentElement;
+
+  /* ================= splash：框線與文字的色相漸變 ================= */
+  let hueRAF = 0;
+  const hueT0 = performance.now();
+  function hueTick(now) {
+    const h = (HUE_START + ((now - hueT0) / HUE_PERIOD) * 360) % 360;
+    root.style.setProperty('--c', `hsl(${h.toFixed(2)}, 100%, 50%)`); // 最高彩度
+    hueRAF = requestAnimationFrame(hueTick);
+  }
+  hueRAF = requestAnimationFrame(hueTick);
+
+  /* ================= WebGL ================= */
+  const VERT = `
+    attribute vec2 aPos;
+    void main() { gl_Position = vec4(aPos, 0.0, 1.0); }
+  `;
+
+  // 每個像素反向取樣，把攝影機畫面的座標重新排列：
+  //   「半徑」r → 攝影機畫面的第幾條 x 軸
+  //   沿著那一圈的位置 → 那條 x 軸上的位置（一條 x 軸等比拉長／縮短成那一圈的周長）
+  // 取樣形狀 uShape：
+  //   0 = 圓形：r = 到中心的距離，最外圈 = 畫面對角線的一半
+  //   1 = 方形：同心長方形，長寬比 = 螢幕比例，最外圈 = 螢幕邊框
+  //       r = max(|x| / aspect, |y|)，那一圈的半寬 = r·aspect、半高 = r
+  // 方向 uFlip：
+  //   0：最上方 → 中心，最底 → 最外圈；12 點鐘起順時針 = 由左到右（臉落在下方、正立）
+  //   1：最底 → 中心，最上方 → 最外圈；6 點鐘起逆時針 = 由左到右（臉落在上方、正立）
+  // uMirror：自拍鏡頭維持照鏡子的左右；後鏡頭左右反過來，景物和文字才是正的
+  const FRAG = `
+    #ifdef GL_FRAGMENT_PRECISION_HIGH
+      precision highp float;
+    #else
+      precision mediump float;
+    #endif
+    uniform sampler2D uTex;
+    uniform vec2  uCenter;  // 畫面中心（裝置像素）
+    uniform float uRmax;    // 最外圈
+    uniform vec4  uCrop;    // 攝影機畫面 cover 到螢幕比例後的範圍：x0, y0, w, h
+    uniform float uFlip;    // 0 或 1，方向
+    uniform float uShape;   // 0 圓形，1 方形（貼合螢幕比例）
+    uniform float uAspect;  // 螢幕寬 / 高
+    uniform float uMirror;  // 1 = 後鏡頭
+    void main() {
+      vec2 p = gl_FragCoord.xy - uCenter;          // y 朝上
+      float r, u;
+      if (uShape < 0.5) {
+        r = length(p);
+        float a = atan(p.x, p.y);                  // 12 點鐘 = 0，順時針遞增
+        u = fract(a / 6.283185307179586 + 1.0);
+      } else {
+        float ax = abs(p.x) / uAspect, ay = abs(p.y);
+        r = max(ax, ay);                           // 同心長方形（螢幕比例）
+        float hw = r * uAspect;                    // 這一圈的半寬
+        float hh = r;                              // 這一圈的半高
+        float per = 4.0 * (hw + hh);               // 周長
+        // 沿長方形周長的位置：12 點鐘（上邊中點）起順時針
+        float arc;
+        if (ay >= ax) {
+          arc = p.y > 0.0 ? (p.x >= 0.0 ? p.x : per + p.x)              // 上邊
+                          : 2.0 * hw + 2.0 * hh - p.x;                  // 下邊
+        } else {
+          arc = p.x > 0.0 ? hw + hh - p.y                               // 右邊
+                          : 3.0 * hw + 3.0 * hh + p.y;                  // 左邊
+        }
+        u = r > 0.0 ? fract(arc / per) : 0.0;
+      }
+      float v = clamp(r / uRmax, 0.0, 1.0);
+      if (uFlip > 0.5) {
+        u = fract(1.5 - u);                        // 改成 6 點鐘起、逆時針
+        v = 1.0 - v;                               // 底 → 中心，頂 → 最外圈
+      }
+      if (uMirror > 0.5) u = 1.0 - u;
+      vec2 tc = uCrop.xy + vec2(u, v) * uCrop.zw;
+      gl_FragColor = vec4(texture2D(uTex, tc).rgb, 1.0);
+    }
+  `;
+
+  let gl = null, prog = null, tex = null, U = {};
+
+  function initGL() {
+    if (gl) return true;
+    gl = canvas.getContext('webgl', {
+      antialias: false,
+      alpha: false,
+      depth: false,
+      stencil: false,
+      premultipliedAlpha: false
+    }) || canvas.getContext('experimental-webgl', { alpha: false });
+    if (!gl) return false;
+
+    const sh = (type, src) => {
+      const s = gl.createShader(type);
+      gl.shaderSource(s, src);
+      gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+      return s;
+    };
+    prog = gl.createProgram();
+    gl.attachShader(prog, sh(gl.VERTEX_SHADER, VERT));
+    gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, FRAG));
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+    gl.useProgram(prog);
+
+    const buf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1]), gl.STATIC_DRAW);
+    const aPos = gl.getAttribLocation(prog, 'aPos');
+    gl.enableVertexAttribArray(aPos);
+    gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+    ['uTex', 'uCenter', 'uRmax', 'uCrop', 'uFlip', 'uShape', 'uAspect', 'uMirror']
+      .forEach(n => { U[n] = gl.getUniformLocation(prog, n); });
+
+    tex = gl.createTexture();
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.uniform1i(U.uTex, 0);
+    gl.clearColor(BG[0], BG[1], BG[2], 1);
+    return true;
+  }
+
+  /* ================= 四種排列方式 ================= */
+  const MODES = [
+    { flip: 1, shape: 0 },  // 載入時：最底 → 圓心，最上方 → 最外圈（圓形）
+    { flip: 0, shape: 0 },  // 最上方 → 圓心，最底 → 最外圈（圓形）
+    { flip: 1, shape: 1 },  // 最底 → 中心，最上方 → 最外圈（方形，貼合螢幕比例）
+    { flip: 0, shape: 1 }   // 最上方 → 中心，最底 → 最外圈（方形，貼合螢幕比例）
+  ];
+  let mode = 0;
+
+  /* ================= 尺寸 ================= */
+  let W = 0, H = 0;
+
+  function applyMode() {
+    const m = MODES[mode];
+    const Rmax = m.shape === 0
+      ? Math.hypot(W, H) / 2                     // 圓：剛好蓋住四個角
+      : H / 2;                                   // 方形：最外圈就是螢幕邊框（以半高計）
+    gl.uniform1f(U.uFlip, m.flip);
+    gl.uniform1f(U.uShape, m.shape);
+    gl.uniform1f(U.uAspect, W / H);
+    gl.uniform1f(U.uRmax, Rmax);
+  }
+
+  function resize() {
+    if (!gl) return;
+    const dpr = Math.min(window.devicePixelRatio || 1, MAX_DPR);
+    const w = Math.max(1, Math.round(window.innerWidth * dpr));
+    const h = Math.max(1, Math.round(window.innerHeight * dpr));
+    if (w === W && h === H) return;
+    W = canvas.width = w;
+    H = canvas.height = h;
+    gl.viewport(0, 0, W, H);
+    gl.uniform2f(U.uCenter, W / 2, H / 2);
+    applyMode();
+  }
+  window.addEventListener('resize', resize);
+
+  // 攝影機畫面以 cover 方式對到螢幕比例（等同全螢幕顯示時看到的那個畫面）
+  function updateCrop(vw, vh) {
+    const va = vw / vh, sa = W / H;
+    if (va > sa) {
+      const cw = sa / va;
+      gl.uniform4f(U.uCrop, (1 - cw) / 2, 0, cw, 1);
+    } else {
+      const ch = va / sa;
+      gl.uniform4f(U.uCrop, 0, (1 - ch) / 2, 1, ch);
+    }
+  }
+
+  /* ================= 每幀即時重新排列 ================= */
+  let running = false;
+
+  function frame() {
+    requestAnimationFrame(frame);
+    if (!running || video.readyState < 2 || !video.videoWidth) return;  // 切換鏡頭時停在上一幀
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, video);
+    updateCrop(video.videoWidth, video.videoHeight);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+  }
+
+  /* ================= 相機 ================= */
+  let stream = null;
+  let facing = 'user';        // 預設自拍鏡頭
+  let multiCam = false;       // 有兩顆以上鏡頭才開放點兩下切換
+  let switching = false;
+
+  function stopStream() {
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    stream = null;
+  }
+
+  async function openCamera(want, deviceId) {
+    stopStream();                                // iOS 要先關掉舊的才能開另一顆
+    const video_ = { width: { ideal: 1920 }, height: { ideal: 1080 } };
+    if (deviceId) video_.deviceId = { exact: deviceId };
+    else video_.facingMode = want;
+    const s = await navigator.mediaDevices.getUserMedia({ audio: false, video: video_ });
+    stream = s;
+    video.srcObject = s;
+    await video.play();
+
+    // 以鏡頭實際回報的方向為準（桌機 webcam 通常沒有回報，就用要求的方向）
+    const track = s.getVideoTracks()[0];
+    const st = track && track.getSettings ? track.getSettings() : {};
+    facing = st.facingMode === 'environment' || st.facingMode === 'user' ? st.facingMode : want;
+    gl.uniform1f(U.uMirror, facing === 'environment' ? 1 : 0);
+  }
+
+  async function listCameras() {
+    try {
+      const list = await navigator.mediaDevices.enumerateDevices();
+      return list.filter(d => d.kind === 'videoinput');
+    } catch (e) {
+      return [];
+    }
+  }
+
+  function currentDeviceId() {
+    const t = stream && stream.getVideoTracks()[0];
+    return t && t.getSettings ? t.getSettings().deviceId : undefined;
+  }
+
+  async function switchCamera() {
+    if (!multiCam || switching) return;
+    switching = true;
+    const prev = facing;
+    const prevId = currentDeviceId();
+    const want = prev === 'user' ? 'environment' : 'user';
+    try {
+      await openCamera(want);
+      // 沒有回報前後方向的鏡頭（例如桌機接兩顆 webcam）：還是同一顆的話，改開下一顆
+      const id = currentDeviceId();
+      if (prevId && id === prevId) {
+        const cams = await listCameras();
+        const i = cams.findIndex(d => d.deviceId === prevId);
+        const next = cams[(i + 1) % cams.length];
+        if (next && next.deviceId && next.deviceId !== prevId) await openCamera(want, next.deviceId);
+      }
+    } catch (err) {
+      console.error(err);
+      try { await openCamera(prev); }            // 換不過去就回到原本那顆
+      catch (err2) { console.error(err2); showSplash(true); }
+    }
+    switching = false;
+  }
+
+  /* ================= splash ↔ 畫面 ================= */
+  function showSplash(unavailable) {
+    running = false;
+    stopStream();
+    msg.hidden = !unavailable;
+    go.disabled = false;
+    splash.classList.remove('gone');
+    cancelAnimationFrame(hueRAF);
+    hueRAF = requestAnimationFrame(hueTick);
+  }
+
+  async function start() {
+    go.disabled = true;
+    msg.hidden = true;
+    try {
+      if (!initGL()) throw new Error('webgl');
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error('nocam');
+      resize();
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      await openCamera(facing);
+      multiCam = (await listCameras()).length > 1;
+      running = true;
+      splash.classList.add('gone');
+      cancelAnimationFrame(hueRAF);
+    } catch (err) {
+      console.error(err);
+      showSplash(true);                          // 顯示 Camera Unavailable，再點按鈕重新取得
+    }
+  }
+
+  go.addEventListener('click', start);
+
+  // 回到前景時，若相機被系統關掉就重新打開
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible' || !running || switching) return;
+    const t = stream && stream.getVideoTracks()[0];
+    if (!t || t.readyState === 'ended') {
+      openCamera(facing).catch(err => { console.error(err); showSplash(true); });
+    } else if (video.paused) {
+      video.play().catch(() => {});
+    }
+  });
+
+  /* ================= 點一下：換排列方式；點兩下：換鏡頭 ================= */
+  let tapTimer = 0, lastTapT = 0, lastTapX = 0, lastTapY = 0;
+
+  function nextMode() {
+    mode = (mode + 1) % MODES.length;
+    applyMode();
+  }
+
+  window.addEventListener('pointerdown', (e) => {
+    if (!running) return;
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+
+    if (!multiCam) {                             // 只有一顆鏡頭：點一下立即換
+      nextMode();
+      return;
+    }
+
+    const now = performance.now();
+    const near = Math.hypot(e.clientX - lastTapX, e.clientY - lastTapY) < 60;
+    if (tapTimer && now - lastTapT < DOUBLE_TAP && near) {
+      clearTimeout(tapTimer);                    // 第二下：取消換模式，改成換鏡頭
+      tapTimer = 0;
+      switchCamera();
+      return;
+    }
+    lastTapT = now;
+    lastTapX = e.clientX;
+    lastTapY = e.clientY;
+    tapTimer = setTimeout(() => { tapTimer = 0; nextMode(); }, DOUBLE_TAP);
+  });
+
+  // 桌機上點兩下不要選取文字或放大
+  window.addEventListener('dblclick', e => e.preventDefault());
+
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
